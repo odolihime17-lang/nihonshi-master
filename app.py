@@ -36,7 +36,7 @@ if not user_id:
     try:
         st_html(f"""
             <script>
-            document.cookie = "nihonshi_user_id={user_id}; path=/; max-age=31536000; SameSite=Lax";
+            window.parent.document.cookie = "nihonshi_user_id={user_id}; path=/; max-age=31536000; SameSite=Lax";
             </script>
         """, height=0)
     except Exception:
