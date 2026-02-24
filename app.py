@@ -2,7 +2,9 @@
 app.py — 日本史学習Webアプリ (Streamlit)
 """
 
+import uuid
 import streamlit as st
+from streamlit.components.v1 import html as st_html
 from db import init_db, save_result, get_weak_areas, get_recent_wrong_questions, get_stats
 from pdf_utils import extract_text_from_pdf, extract_text_from_drive_url
 from quiz_generator import generate_quiz, prefetch_quiz_async
@@ -19,6 +21,23 @@ st.set_page_config(
 )
 
 init_db()
+
+# ---------------------------------------------------------------------------
+# Cookie-based user identification
+# ---------------------------------------------------------------------------
+
+user_id = st.context.cookies.get("nihonshi_user_id", "")
+
+if not user_id:
+    user_id = str(uuid.uuid4())
+    st_html(f"""
+        <script>
+        document.cookie = "nihonshi_user_id={user_id}; path=/; max-age=31536000; SameSite=Lax";
+        </script>
+    """, height=0)
+
+if not user_id:
+    user_id = "anonymous"
 
 # ---------------------------------------------------------------------------
 # Custom CSS
@@ -40,6 +59,13 @@ html, body, [class*="st-"] {
 }
 .stMainBlockContainer {
     background: #f8f9fb;
+}
+
+/* ── Sidebar toggle: base styling (JS handles the text replacement) ── */
+@media (max-width: 768px) {
+    header[data-testid="stHeader"] [data-testid="stToolbar"] {
+        display: none !important;
+    }
 }
 
 /* ── Sidebar ── */
@@ -250,17 +276,105 @@ section[data-testid="stSidebar"] div.stButton > button:hover {
     font-size: 0.8rem;
     margin: 0.2rem;
 }
+
+/* ── PDF file chip ── */
+.pdf-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    color: #4338ca;
+    border-radius: 999px;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.8rem;
+    margin: 0.2rem;
+    font-weight: 500;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
+# (Custom JS hamburger/swipe removed — using restyled native Streamlit controls)
+
+# ---------------------------------------------------------------------------
+# JavaScript: fix sidebar buttons + swipe gesture
+# (Finds buttons by their text content to work across all Streamlit versions)
+# ---------------------------------------------------------------------------
+
+st_html("""
+<script>
+(function() {
+    const parentDoc = window.parent.document;
+
+    function fixButtons() {
+        // Find all buttons/spans containing the icon text
+        const allElements = parentDoc.querySelectorAll('button, span');
+        for (const el of allElements) {
+            const text = el.textContent.trim();
+            if (text === 'keyboard_double_arrow_right') {
+                // This is the sidebar OPEN button
+                el.textContent = '';
+                el.style.fontSize = '0';
+                el.innerHTML = '<span style="font-size:1.5rem;color:#4f46e5;">☰</span>';
+            } else if (text === 'keyboard_double_arrow_left') {
+                // This is the sidebar CLOSE button (in header when sidebar open)
+                el.textContent = '';
+                el.style.fontSize = '0';
+                el.innerHTML = '<span style="font-size:1.5rem;color:#4f46e5;">☰</span>';
+            } else if (text === 'close') {
+                // Sidebar internal close button
+                el.textContent = '';
+                el.style.fontSize = '0';
+                el.innerHTML = '<span style="font-size:1.2rem;color:#666;">✕</span>';
+            }
+        }
+    }
+
+    // Run immediately and periodically (Streamlit re-renders the DOM)
+    fixButtons();
+    setInterval(fixButtons, 500);
+
+    // Also observe DOM changes
+    const observer = new MutationObserver(fixButtons);
+    observer.observe(parentDoc.body, { childList: true, subtree: true });
+
+    // --- Swipe gesture support ---
+    let touchStartX = 0;
+    let touchStartY = 0;
+    const SWIPE_THRESHOLD = 50;
+
+    parentDoc.addEventListener('touchstart', function(e) {
+        touchStartX = e.changedTouches[0].screenX;
+        touchStartY = e.changedTouches[0].screenY;
+    }, {passive: true});
+
+    parentDoc.addEventListener('touchend', function(e) {
+        const dx = e.changedTouches[0].screenX - touchStartX;
+        const dy = e.changedTouches[0].screenY - touchStartY;
+
+        if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > SWIPE_THRESHOLD) {
+            if (dx > 0 && touchStartX < 50) {
+                // Right swipe from left edge -> open sidebar
+                const openBtn = parentDoc.querySelector('button[data-testid="collapsedControl"]');
+                if (openBtn) openBtn.click();
+            } else if (dx < 0) {
+                // Left swipe -> close sidebar
+                const closeBtn = parentDoc.querySelector('[data-testid="stSidebarCollapseButton"] button');
+                if (closeBtn) closeBtn.click();
+            }
+        }
+    }, {passive: true});
+})();
+</script>
+""", height=0)
 # ---------------------------------------------------------------------------
 # Session state defaults
 # ---------------------------------------------------------------------------
 
 _DEFAULTS = {
-    "pdf_text": "",
+    "pdf_texts": {},        # dict[str, str] — filename → extracted text
     "questions": [],
     "current_index": 0,
     "score": 0,
@@ -272,10 +386,26 @@ _DEFAULTS = {
     "generating": False,
     "total_sessions": 0,
     "user_answers": [],  # Track per-question: list of chosen indices
+    "drive_urls": [],    # List of Google Drive URLs added
 }
 for key, val in _DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
+
+# ---------------------------------------------------------------------------
+# Helper: combined PDF text
+# ---------------------------------------------------------------------------
+
+
+def _get_combined_pdf_text() -> str:
+    """Combine all uploaded PDF texts into one string."""
+    if not st.session_state.pdf_texts:
+        return ""
+    return "\n\n".join(
+        f"=== {fname} ===\n{text}"
+        for fname, text in st.session_state.pdf_texts.items()
+    )
+
 
 # ---------------------------------------------------------------------------
 # Era / Field options
@@ -326,20 +456,25 @@ with st.sidebar:
     )
 
     if pdf_method == "ファイルアップロード":
-        uploaded_pdf = st.file_uploader(
-            "PDFファイルを選択",
+        uploaded_pdfs = st.file_uploader(
+            "PDFファイルを選択（複数可）",
             type=["pdf"],
-            help="学校のプリントや参考資料をアップロード（10MB以下）",
+            accept_multiple_files=True,
+            help="学校のプリントや参考資料をアップロード（各10MB以下）",
             label_visibility="collapsed",
         )
-        if uploaded_pdf is not None and not st.session_state.pdf_text:
-            file_size_mb = len(uploaded_pdf.getvalue()) / (1024 * 1024)
-            if file_size_mb > 10:
-                st.error(f"⚠️ ファイルサイズが大きすぎます（{file_size_mb:.1f}MB）。10MB以下にしてください。")
-            else:
-                with st.spinner(f"📖 テキストを抽出中... ({file_size_mb:.1f}MB)"):
-                    st.session_state.pdf_text = extract_text_from_pdf(uploaded_pdf)
-                st.success(f"✅ {len(st.session_state.pdf_text):,} 文字を抽出しました")
+        if uploaded_pdfs:
+            for uploaded_pdf in uploaded_pdfs:
+                fname = uploaded_pdf.name
+                if fname not in st.session_state.pdf_texts:
+                    file_size_mb = len(uploaded_pdf.getvalue()) / (1024 * 1024)
+                    if file_size_mb > 10:
+                        st.error(f"⚠️ {fname} が大きすぎます（{file_size_mb:.1f}MB）。10MB以下にしてください。")
+                    else:
+                        with st.spinner(f"📖 {fname} を読み込み中... ({file_size_mb:.1f}MB)"):
+                            text = extract_text_from_pdf(uploaded_pdf)
+                            st.session_state.pdf_texts[fname] = text
+                        st.success(f"✅ {fname}: {len(text):,} 文字を抽出")
     else:
         drive_url = st.text_input(
             "Google Drive の共有リンク",
@@ -347,20 +482,41 @@ with st.sidebar:
             label_visibility="collapsed",
         )
         st.caption("💡 Google Drive で「リンクを知っている全員が閲覧可」に設定してください")
-        if drive_url and not st.session_state.pdf_text:
+        if drive_url:
             if st.button("📥 ダウンロードして読み込み", use_container_width=True):
-                with st.spinner("📖 Google Drive からダウンロード中..."):
-                    try:
-                        st.session_state.pdf_text = extract_text_from_drive_url(drive_url)
-                        st.success(f"✅ {len(st.session_state.pdf_text):,} 文字を抽出しました")
-                    except (ValueError, RuntimeError) as e:
-                        st.error(f"❌ {e}")
+                # Generate a short label from the URL
+                url_label = f"Drive_{len(st.session_state.pdf_texts) + 1}"
+                if url_label not in st.session_state.pdf_texts:
+                    with st.spinner("📖 Google Drive からダウンロード中..."):
+                        try:
+                            text = extract_text_from_drive_url(drive_url)
+                            st.session_state.pdf_texts[url_label] = text
+                            st.success(f"✅ {url_label}: {len(text):,} 文字を抽出")
+                        except (ValueError, RuntimeError) as e:
+                            st.error(f"❌ {e}")
 
-    # Show loaded status
-    if st.session_state.pdf_text:
-        st.info(f"📎 PDF読み込み済み（{len(st.session_state.pdf_text):,}文字）")
-        if st.button("🗑️ PDFをクリア", use_container_width=True):
-            st.session_state.pdf_text = ""
+    # Show loaded files
+    if st.session_state.pdf_texts:
+        st.markdown("---")
+        st.markdown(f"**📎 読み込み済みファイル（{len(st.session_state.pdf_texts)}件）**")
+        total_chars = sum(len(t) for t in st.session_state.pdf_texts.values())
+        st.caption(f"合計 {total_chars:,} 文字")
+
+        for fname in list(st.session_state.pdf_texts.keys()):
+            char_count = len(st.session_state.pdf_texts[fname])
+            col_name, col_del = st.columns([4, 1])
+            with col_name:
+                st.markdown(
+                    f'<span class="pdf-chip">📄 {fname} ({char_count:,}字)</span>',
+                    unsafe_allow_html=True,
+                )
+            with col_del:
+                if st.button("🗑", key=f"del_{fname}", help=f"{fname} を削除"):
+                    del st.session_state.pdf_texts[fname]
+                    st.rerun()
+
+        if st.button("🗑️ 全てクリア", use_container_width=True):
+            st.session_state.pdf_texts = {}
             st.rerun()
 
     st.markdown("---")
@@ -383,7 +539,7 @@ with st.sidebar:
     # Stats in sidebar
     st.markdown("---")
     st.markdown("## 📊 学習統計")
-    stats = get_stats()
+    stats = get_stats(user_id=user_id)
     if stats["total"] > 0:
         col1, col2 = st.columns(2)
         with col1:
@@ -392,7 +548,7 @@ with st.sidebar:
             st.metric("正答率", f"{stats['accuracy']}%")
 
         # Weak areas
-        weak = get_weak_areas()
+        weak = get_weak_areas(user_id=user_id)
         if weak:
             st.markdown("#### 🔴 苦手分野")
             for wa in weak:
@@ -408,14 +564,16 @@ with st.sidebar:
 # Helper: start quiz generation
 # ---------------------------------------------------------------------------
 
+combined_pdf_text = _get_combined_pdf_text()
+
 
 def _generate_new_quiz():
     """Generate a new set of 10 questions."""
-    weak_areas = get_weak_areas()
-    wrong_questions = get_recent_wrong_questions()
+    weak_areas = get_weak_areas(user_id=user_id)
+    wrong_questions = get_recent_wrong_questions(user_id=user_id)
 
     questions = generate_quiz(
-        pdf_text=st.session_state.pdf_text,
+        pdf_text=combined_pdf_text,
         era=era,
         field=field,
         weak_areas=weak_areas,
@@ -428,10 +586,10 @@ def _start_prefetch():
     """Start prefetching the next quiz set in the background."""
     holder: dict = {}
     st.session_state.prefetch_holder = holder
-    weak_areas = get_weak_areas()
-    wrong_questions = get_recent_wrong_questions()
+    weak_areas = get_weak_areas(user_id=user_id)
+    wrong_questions = get_recent_wrong_questions(user_id=user_id)
     thread = prefetch_quiz_async(
-        pdf_text=st.session_state.pdf_text,
+        pdf_text=combined_pdf_text,
         era=era,
         field=field,
         weak_areas=weak_areas,
@@ -454,7 +612,7 @@ st.markdown(
 
 # ── Handle generate button ──
 if generate_clicked:
-    if not st.session_state.pdf_text:
+    if not st.session_state.pdf_texts:
         st.warning("⚠️ まず PDF をアップロードしてください。")
     else:
         st.session_state.generating = True
@@ -487,7 +645,8 @@ if not st.session_state.questions and not st.session_state.generating:
             <p style="font-size:3rem; margin-bottom:0.5rem;">📚</p>
             <p class="question-text">サイドバーからPDFをアップロードし、<br>時代・分野を選択して問題を生成しましょう！</p>
             <p style="color:#94a3b8; font-size:0.9rem;">
-                Gemini AIがあなた専用の4択問題を作成します
+                Gemini AIがあなた専用の4択問題を作成します<br>
+                📱 スマホの方は左上の ☰ ボタンまたは左端からスワイプで設定を開けます
             </p>
         </div>
         """,
@@ -524,7 +683,6 @@ if not st.session_state.questions and not st.session_state.generating:
             st.markdown("#### 時代別")
             for s in stats["by_era"]:
                 progress = s["accuracy"] / 100
-                color = "#22c55e" if s["accuracy"] >= 70 else "#f59e0b" if s["accuracy"] >= 40 else "#ef4444"
                 st.markdown(
                     f'**{s["era"]}** — {s["accuracy"]}%  ({s["correct"]}/{s["total"]})'
                 )
@@ -582,6 +740,7 @@ elif st.session_state.questions and not st.session_state.quiz_finished:
                     is_correct=is_correct,
                     era=q.get("era", era),
                     field=q.get("field", field),
+                    user_id=user_id,
                 )
                 st.rerun()
 
@@ -808,7 +967,7 @@ elif st.session_state.quiz_finished:
 
     with col2:
         if st.button("🔴 苦手分野を復習", use_container_width=True):
-            weak = get_weak_areas(limit=1)
+            weak = get_weak_areas(limit=1, user_id=user_id)
             if weak:
                 st.session_state.quiz_finished = False
                 st.session_state.generating = True
@@ -816,9 +975,9 @@ elif st.session_state.quiz_finished:
                 review_field = weak[0]["field"]
                 with st.spinner(f"🤖 {review_era} / {review_field} の問題を生成中..."):
                     try:
-                        wrong_qs_text = get_recent_wrong_questions()
+                        wrong_qs_text = get_recent_wrong_questions(user_id=user_id)
                         questions = generate_quiz(
-                            pdf_text=st.session_state.pdf_text,
+                            pdf_text=combined_pdf_text,
                             era=review_era,
                             field=review_field,
                             weak_areas=weak,

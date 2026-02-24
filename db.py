@@ -1,5 +1,6 @@
 """
 db.py — SQLite database module for quiz history persistence.
+Supports per-user data isolation via user_id.
 """
 
 from __future__ import annotations
@@ -31,9 +32,15 @@ def init_db() -> None:
                 is_correct INTEGER NOT NULL,
                 era TEXT NOT NULL,
                 field TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT 'anonymous'
             )
         """)
+        # Add user_id column to existing tables that don't have it
+        try:
+            conn.execute("ALTER TABLE quiz_results ADD COLUMN user_id TEXT NOT NULL DEFAULT 'anonymous'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         conn.commit()
     finally:
         conn.close()
@@ -46,6 +53,7 @@ def save_result(
     is_correct: bool,
     era: str,
     field: str,
+    user_id: str = "anonymous",
 ) -> None:
     """Save a single quiz result to the database."""
     conn = _get_connection()
@@ -53,8 +61,8 @@ def save_result(
         conn.execute(
             """
             INSERT INTO quiz_results
-                (question_text, user_answer, correct_answer, is_correct, era, field, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (question_text, user_answer, correct_answer, is_correct, era, field, created_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 question,
@@ -64,6 +72,7 @@ def save_result(
                 era,
                 field,
                 datetime.now().isoformat(),
+                user_id,
             ),
         )
         conn.commit()
@@ -71,7 +80,7 @@ def save_result(
         conn.close()
 
 
-def get_weak_areas(limit: int = 5) -> list[dict]:
+def get_weak_areas(limit: int = 5, user_id: str = "anonymous") -> list[dict]:
     """
     Return the (era, field) pairs with the highest error rates.
     Only considers pairs with at least 2 attempts.
@@ -88,19 +97,20 @@ def get_weak_areas(limit: int = 5) -> list[dict]:
                        / COUNT(*) * 100, 1
                    ) AS error_rate
             FROM quiz_results
+            WHERE user_id = ?
             GROUP BY era, field
             HAVING total >= 2
             ORDER BY error_rate DESC
             LIMIT ?
             """,
-            (limit,),
+            (user_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_recent_wrong_questions(limit: int = 20) -> list[str]:
+def get_recent_wrong_questions(limit: int = 20, user_id: str = "anonymous") -> list[str]:
     """Return recent incorrectly-answered question texts for prompt injection."""
     conn = _get_connection()
     try:
@@ -108,18 +118,18 @@ def get_recent_wrong_questions(limit: int = 20) -> list[str]:
             """
             SELECT DISTINCT question_text
             FROM quiz_results
-            WHERE is_correct = 0
+            WHERE is_correct = 0 AND user_id = ?
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (user_id, limit),
         ).fetchall()
         return [r["question_text"] for r in rows]
     finally:
         conn.close()
 
 
-def get_stats() -> dict:
+def get_stats(user_id: str = "anonymous") -> dict:
     """
     Return overall and per-era/field accuracy stats.
     Returns: {
@@ -138,7 +148,9 @@ def get_stats() -> dict:
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) AS correct
             FROM quiz_results
-            """
+            WHERE user_id = ?
+            """,
+            (user_id,),
         ).fetchone()
         total = row["total"]
         correct = row["correct"] or 0
@@ -157,9 +169,11 @@ def get_stats() -> dict:
                            / COUNT(*) * 100, 1
                        ) AS accuracy
                 FROM quiz_results
+                WHERE user_id = ?
                 GROUP BY era
                 ORDER BY total DESC
-                """
+                """,
+                (user_id,),
             ).fetchall()
         ]
 
@@ -176,9 +190,11 @@ def get_stats() -> dict:
                            / COUNT(*) * 100, 1
                        ) AS accuracy
                 FROM quiz_results
+                WHERE user_id = ?
                 GROUP BY field
                 ORDER BY total DESC
-                """
+                """,
+                (user_id,),
             ).fetchall()
         ]
 
