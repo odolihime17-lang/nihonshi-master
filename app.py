@@ -652,7 +652,7 @@ if not st.session_state.questions and not st.session_state.generating:
             <p class="question-text">サイドバーからPDFをアップロードし、<br>時代・分野を選択して問題を生成しましょう！</p>
             <p style="color:#94a3b8; font-size:0.9rem;">
                 Gemini AIがあなた専用の4択問題を作成します<br>
-                📱 スマホの方は左上の ☰ ボタンまたは左端からスワイプで設定を開けます
+                📱 スマホの方は左上の ☰ ボタンまたは右端から左にスワイプで設定を開けます
             </p>
         </div>
         """,
