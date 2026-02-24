@@ -26,15 +26,21 @@ init_db()
 # Cookie-based user identification
 # ---------------------------------------------------------------------------
 
-user_id = st.context.cookies.get("nihonshi_user_id", "")
+try:
+    user_id = st.context.cookies.get("nihonshi_user_id", "")
+except Exception:
+    user_id = ""
 
 if not user_id:
     user_id = str(uuid.uuid4())
-    st_html(f"""
-        <script>
-        document.cookie = "nihonshi_user_id={user_id}; path=/; max-age=31536000; SameSite=Lax";
-        </script>
-    """, height=0)
+    try:
+        st_html(f"""
+            <script>
+            document.cookie = "nihonshi_user_id={user_id}; path=/; max-age=31536000; SameSite=Lax";
+            </script>
+        """, height=0)
+    except Exception:
+        pass
 
 if not user_id:
     user_id = "anonymous"
