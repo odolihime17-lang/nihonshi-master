@@ -381,8 +381,9 @@ _DEFAULTS = {
     "prefetch_thread": None,
     "generating": False,
     "total_sessions": 0,
-    "user_answers": [],  # Track per-question: list of chosen indices
+    "user_answers": [],  # Track per-question: list of chosen indices or text entries
     "drive_urls": [],    # List of Google Drive URLs added
+    "quiz_type": "4択問題",
 }
 for key, val in _DEFAULTS.items():
     if key not in st.session_state:
@@ -434,6 +435,16 @@ FIELDS = [
     "宗教史",
     "法制史",
     "人物史",
+]
+
+# ---------------------------------------------------------------------------
+# Quiz Type options
+# ---------------------------------------------------------------------------
+
+QUIZ_TYPES = [
+    "4択問題",
+    "一問一答",
+    "共通テスト形式（正誤判定）",
 ]
 
 # ---------------------------------------------------------------------------
@@ -553,8 +564,11 @@ with st.sidebar:
     selected_field = st.selectbox("📚 分野を選択", FIELDS, index=0)
     custom_field = st.text_input("または自由入力（分野）", placeholder="例: 建築史")
 
-    era = custom_era if custom_era else selected_era
     field = custom_field if custom_field else selected_field
+
+    st.markdown("---")
+    selected_quiz_type = st.radio("📝 出題形式を選択", QUIZ_TYPES, index=QUIZ_TYPES.index(st.session_state.quiz_type))
+    st.session_state.quiz_type = selected_quiz_type
 
     st.markdown("---")
 
@@ -601,6 +615,7 @@ def _generate_new_quiz():
         pdf_text=combined_pdf_text,
         era=era,
         field=field,
+        quiz_type=st.session_state.quiz_type,
         weak_areas=weak_areas,
         wrong_questions=wrong_questions,
     )
@@ -617,6 +632,7 @@ def _start_prefetch():
         pdf_text=combined_pdf_text,
         era=era,
         field=field,
+        quiz_type=st.session_state.quiz_type,
         weak_areas=weak_areas,
         wrong_questions=wrong_questions,
         result_holder=holder,
@@ -631,7 +647,7 @@ def _start_prefetch():
 # Title
 st.markdown('<div class="app-title">🏯 日本史マスター</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="app-subtitle">AIが生成する4択問題で日本史の実力を鍛えよう</div>',
+    f'<div class="app-subtitle">AIが生成する{st.session_state.quiz_type}で日本史の実力を鍛えよう</div>',
     unsafe_allow_html=True,
 )
 
@@ -749,65 +765,138 @@ elif st.session_state.questions and not st.session_state.quiz_finished:
             st.rerun()
 
     # Question card
-    st.markdown(
-        f"""
-        <div class="quiz-card">
-            <span class="question-badge">Q{idx + 1}</span>
-            <div class="question-text">{q["question"]}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if st.session_state.quiz_type == "共通テスト形式（正誤判定）":
+        st.markdown(
+            f"""
+            <div class="quiz-card">
+                <span class="question-badge">Q{idx + 1}</span>
+                <div style="margin-top: 1rem;">
+                    <div style="background-color: #f0f7ff; border-left: 5px solid #007bff; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+                        <strong>文a:</strong><br>{q["statement_a"]}
+                    </div>
+                    <div style="background-color: #f0fff4; border-left: 5px solid #28a745; padding: 10px; border-radius: 5px;">
+                        <strong>文b:</strong><br>{q["statement_b"]}
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div class="quiz-card">
+                <span class="question-badge">Q{idx + 1}</span>
+                <div class="question-text">{q["question"]}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    # ── Not answered yet: show choice buttons ──
+    # ── Not answered yet ──
     if not st.session_state.answered:
-        for i, choice in enumerate(q["choices"]):
-            if st.button(choice, key=f"choice_{idx}_{i}", use_container_width=True):
-                is_correct = i == q["answer_index"]
-                st.session_state.answered = True
-                st.session_state.selected_choice = i
-                st.session_state.user_answers.append(i)
-                if is_correct:
-                    st.session_state.score += 1
+        if st.session_state.quiz_type == "一問一答":
+            user_input = st.text_input("解答を入力してください", key=f"input_{idx}")
+            if st.button("回答する", key=f"btn_{idx}", use_container_width=True):
+                if user_input:
+                    # Simple normalization for comparison
+                    is_correct = user_input.strip() == q["answer"].strip()
+                    st.session_state.answered = True
+                    st.session_state.selected_choice = user_input
+                    st.session_state.user_answers.append(user_input)
+                    if is_correct:
+                        st.session_state.score += 1
 
-                # Save to DB
-                save_result(
-                    question=q["question"],
-                    user_answer=q["choices"][i],
-                    correct_answer=q["choices"][q["answer_index"]],
-                    is_correct=is_correct,
-                    era=q.get("era", era),
-                    field=q.get("field", field),
-                    user_id=user_id,
+                    save_result(
+                        question=q["question"],
+                        user_answer=user_input,
+                        correct_answer=q["answer"],
+                        is_correct=is_correct,
+                        era=q.get("era", era),
+                        field=q.get("field", field),
+                        user_id=user_id,
+                    )
+                    st.rerun()
+                else:
+                    st.warning("解答を入力してください。")
+
+        else:  # 4択 or 共通テスト
+            # For Center Exam, user requirement: st.radio
+            if st.session_state.quiz_type == "共通テスト形式（正誤判定）":
+                choice_idx = st.radio(
+                    "正しい組み合わせを選択してください",
+                    options=range(len(q["choices"])),
+                    format_func=lambda i: q["choices"][i],
+                    key=f"radio_{idx}"
                 )
-                st.rerun()
+                if st.button("回答する", key=f"btn_{idx}", use_container_width=True):
+                    is_correct = choice_idx == q["answer_index"]
+                    st.session_state.answered = True
+                    st.session_state.selected_choice = choice_idx
+                    st.session_state.user_answers.append(choice_idx)
+                    if is_correct:
+                        st.session_state.score += 1
+                    
+                    save_result(
+                        question=q["question"],
+                        user_answer=q["choices"][choice_idx],
+                        correct_answer=q["choices"][q["answer_index"]],
+                        is_correct=is_correct,
+                        era=q.get("era", era),
+                        field=q.get("field", field),
+                        user_id=user_id,
+                    )
+                    st.rerun()
+            else:  # Existing 4-choice button interface
+                for i, choice in enumerate(q["choices"]):
+                    if st.button(choice, key=f"choice_{idx}_{i}", use_container_width=True):
+                        is_correct = i == q["answer_index"]
+                        st.session_state.answered = True
+                        st.session_state.selected_choice = i
+                        st.session_state.user_answers.append(i)
+                        if is_correct:
+                            st.session_state.score += 1
+
+                        save_result(
+                            question=q["question"],
+                            user_answer=q["choices"][i],
+                            correct_answer=q["choices"][q["answer_index"]],
+                            is_correct=is_correct,
+                            era=q.get("era", era),
+                            field=q.get("field", field),
+                            user_id=user_id,
+                        )
+                        st.rerun()
 
     # ── Answered: show result + explanation ──
     else:
         selected = st.session_state.selected_choice
-        correct_idx = q["answer_index"]
-        is_correct = selected == correct_idx
-
-        if is_correct:
-            st.markdown(
-                '<div class="correct-box">✅ <strong>正解！</strong></div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f'<div class="wrong-box">❌ <strong>不正解</strong>　'
-                f'正解: <strong>{q["choices"][correct_idx]}</strong></div>',
-                unsafe_allow_html=True,
-            )
-
-        # Show all choices with visual indicators
-        for i, choice in enumerate(q["choices"]):
-            if i == correct_idx:
-                st.markdown(f"🟢 **{choice}**")
-            elif i == selected and not is_correct:
-                st.markdown(f"🔴 ~~{choice}~~")
+        
+        if st.session_state.quiz_type == "一問一答":
+            correct_answer = q["answer"]
+            is_correct = selected.strip() == correct_answer.strip()
+            if is_correct:
+                st.markdown('<div class="correct-box">✅ <strong>正解！</strong></div>', unsafe_allow_html=True)
             else:
-                st.markdown(f"⚪ {choice}")
+                st.markdown(f'<div class="wrong-box">❌ <strong>不正解</strong>　正解: <strong>{correct_answer}</strong></div>', unsafe_allow_html=True)
+                st.markdown(f"あなたの回答: {selected}")
+        else:
+            correct_idx = q["answer_index"]
+            is_correct = selected == correct_idx
+
+            if is_correct:
+                st.markdown('<div class="correct-box">✅ <strong>正解！</strong></div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="wrong-box">❌ <strong>不正解</strong>　正解: <strong>{q["choices"][correct_idx]}</strong></div>', unsafe_allow_html=True)
+
+            # Show all choices with visual indicators
+            for i, choice in enumerate(q["choices"]):
+                if i == correct_idx:
+                    st.markdown(f"🟢 **{choice}**")
+                elif i == selected and not is_correct:
+                    st.markdown(f"🔴 ~~{choice}~~")
+                else:
+                    st.markdown(f"⚪ {choice}")
 
         # Explanation
         st.markdown(
@@ -909,30 +998,36 @@ elif st.session_state.quiz_finished:
                 unsafe_allow_html=True,
             )
 
-            # Choices grid
-            for ci, choice in enumerate(q["choices"]):
-                if ci == correct_idx and ci == user_ans:
-                    icon = "✅"
-                    style = "background:#f0fdf4; border:1px solid #bbf7d0; color:#166534;"
-                    label = "あなたの回答（正解）"
-                elif ci == correct_idx:
-                    icon = "🟢"
-                    style = "background:#f0fdf4; border:1px solid #bbf7d0; color:#166534;"
-                    label = "正解"
-                elif ci == user_ans:
-                    icon = "🔴"
-                    style = "background:#fef2f2; border:1px solid #fecaca; color:#991b1b;"
-                    label = "あなたの回答"
-                else:
-                    icon = "⚪"
-                    style = "background:#f9fafb; border:1px solid #e5e7eb; color:#6b7280;"
-                    label = ""
+            # Choices or Answer display
+            if "choices" in q:
+                for ci, choice in enumerate(q["choices"]):
+                    if ci == correct_idx and ci == user_ans:
+                        icon = "✅"
+                        style = "background:#f0fdf4; border:1px solid #bbf7d0; color:#166534;"
+                        label = "あなたの回答（正解）"
+                    elif ci == correct_idx:
+                        icon = "🟢"
+                        style = "background:#f0fdf4; border:1px solid #bbf7d0; color:#166534;"
+                        label = "正解"
+                    elif ci == user_ans:
+                        icon = "🔴"
+                        style = "background:#fef2f2; border:1px solid #fecaca; color:#991b1b;"
+                        label = "あなたの回答"
+                    else:
+                        icon = "⚪"
+                        style = "background:#f9fafb; border:1px solid #e5e7eb; color:#6b7280;"
+                        label = ""
 
-                label_html = f' <span style="font-size:0.75rem; color:#888;">← {label}</span>' if label else ""
-                st.markdown(
-                    f'<div style="{style} border-radius:10px; padding:0.6rem 1rem; margin:0.3rem 0; font-size:0.95rem;">{icon} {choice}{label_html}</div>',
-                    unsafe_allow_html=True,
-                )
+                    label_html = f' <span style="font-size:0.75rem; color:#888;">← {label}</span>' if label else ""
+                    st.markdown(
+                        f'<div style="{style} border-radius:10px; padding:0.6rem 1rem; margin:0.3rem 0; font-size:0.95rem;">{icon} {choice}{label_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:  # 一問一答
+                correct_answer = q["answer"]
+                st.markdown(f"**正解:** {correct_answer}")
+                if not is_correct:
+                    st.markdown(f"**あなたの回答:** {user_ans}")
 
             # Explanation
             st.markdown(

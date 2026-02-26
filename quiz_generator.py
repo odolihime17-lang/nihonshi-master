@@ -50,7 +50,8 @@ def _get_client() -> genai.Client:
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-_SYSTEM_INSTRUCTION = """\
+_SYSTEM_INSTRUCTIONS = {
+    "4択問題": """\
 あなたは日本史の教育専門AIです。高校3年生が大学入試に向けて学習するための4択問題を作成してください。
 
 ## ルール
@@ -74,13 +75,68 @@ _SYSTEM_INSTRUCTION = """\
 ]
 ```
 `answer_index` は 0-based (A=0, B=1, C=2, D=3)。
+""",
+    "一問一答": """\
+あなたは日本史の教育専門AIです。高校生が用語を暗記するための一問一答形式の問題を作成してください。
+
+## ルール
+- 必ず **10問** 作成すること。
+- 記述式（テキスト入力）で答える形式にする。
+- 正解（解答となる用語）は1つ。
+- 各問題に **詳しい解説** を付ける。
+- 出力は **JSON配列のみ** 。
+
+## JSON フォーマット (厳守)
+```json
+[
+  {
+    "question": "問題文（例：江戸幕府の初代将軍は？）",
+    "answer": "徳川家康",
+    "explanation": "解説文",
+    "era": "時代名",
+    "field": "分野名"
+  }
+]
+```
+""",
+    "共通テスト形式（正誤判定）": """\
+あなたは日本史の教育専門AIです。大学入学共通テスト形式の正誤判定問題（2つの文章の正誤の組み合わせを選ぶ形式）を作成してください。
+
+## ルール
+- 必ず **10問** 作成すること。
+- 各問題について、2つの歴史的な文章（文a、文b）を生成する。
+- 選択肢は必ず以下の4パターンの組み合わせとして生成する（この順序を厳守）。
+  0: a: 正しい、b: 正しい
+  1: a: 正しい、b: 誤っている
+  2: a: 誤っている、b: 正しい
+  3: a: 誤っている、b: 誤っている
+- 各問題に **詳しい解説** を付ける。文aと文b、それぞれの正誤の理由を明記すること。
+- 出力は **JSON配列のみ** 。
+
+## JSON フォーマット (厳守)
+```json
+[
+  {
+    "statement_a": "歴史的な文章a",
+    "statement_b": "歴史的な文章b",
+    "choices": ["a: 正しい、b: 正しい", "a: 正しい、b: 誤っている", "a: 誤っている、b: 正しい", "a: 誤っている、b: 誤っている"],
+    "answer_index": 0,
+    "explanation": "解説文",
+    "era": "時代名",
+    "field": "分野名"
+  }
+]
+```
+`answer_index` は 0, 1, 2, 3 のいずれか。
 """
+}
 
 
 def _build_user_prompt(
     pdf_text: str,
     era: str,
     field: str,
+    quiz_type: str = "4択問題",
     weak_areas: list[dict] | None = None,
     wrong_questions: list[str] | None = None,
 ) -> str:
@@ -88,6 +144,7 @@ def _build_user_prompt(
     parts: list[str] = []
 
     # Target scope
+    parts.append(f"## 出題形式\n- {quiz_type}\n")
     parts.append(f"## 出題範囲\n- 時代: {era}\n- 分野: {field}\n")
 
     # Weak areas
@@ -116,7 +173,7 @@ def _build_user_prompt(
         parts.append(f"## 参考資料（プリントの内容）\n{truncated}\n")
 
     parts.append(
-        "上記の情報を踏まえて、10問の4択問題をJSON配列で出力してください。"
+        f"上記の情報を踏まえて、10問の{quiz_type}をJSON配列で出力してください。"
     )
 
     return "\n".join(parts)
@@ -127,7 +184,7 @@ def _build_user_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _parse_quiz_json(text: str) -> list[dict[str, Any]]:
+def _parse_quiz_json(text: str, quiz_type: str) -> list[dict[str, Any]]:
     """
     Parse the model output to extract the JSON array of questions.
     Handles markdown fences and truncated/incomplete JSON gracefully.
@@ -136,10 +193,13 @@ def _parse_quiz_json(text: str) -> list[dict[str, Any]]:
 
     # Remove markdown code fences if present
     if cleaned.startswith("```"):
-        first_newline = cleaned.index("\n")
-        cleaned = cleaned[first_newline + 1 :]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[: -len("```")]
+        try:
+            first_newline = cleaned.index("\n")
+            cleaned = cleaned[first_newline + 1 :]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[: -len("```")]
+        except ValueError:
+            pass
         cleaned = cleaned.strip()
 
     # First try: parse as-is
@@ -158,15 +218,27 @@ def _parse_quiz_json(text: str) -> list[dict[str, Any]]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        has_keys = all(k in item for k in ("question", "choices", "answer_index"))
-        if not has_keys:
-            continue
-        if not isinstance(item.get("choices"), list) or len(item["choices"]) != 4:
-            continue
-        item.setdefault("explanation", "解説は省略されました。")
-        item.setdefault("era", "未分類")
-        item.setdefault("field", "未分類")
-        valid.append(item)
+        
+        if quiz_type == "4択問題":
+            has_keys = all(k in item for k in ("question", "choices", "answer_index"))
+            if has_keys and isinstance(item.get("choices"), list) and len(item["choices"]) == 4:
+                valid.append(item)
+        elif quiz_type == "一問一答":
+            has_keys = all(k in item for k in ("question", "answer"))
+            if has_keys:
+                valid.append(item)
+        elif quiz_type == "共通テスト形式（正誤判定）":
+            has_keys = all(k in item for k in ("statement_a", "statement_b", "choices", "answer_index"))
+            if has_keys and isinstance(item.get("choices"), list) and len(item["choices"]) == 4:
+                # Add a 'question' field for consistency in app.py logic
+                item["question"] = f"文a: {item['statement_a']}\n文b: {item['statement_b']}"
+                valid.append(item)
+
+        # Common fields
+        if valid and valid[-1] == item:
+            item.setdefault("explanation", "解説は省略されました。")
+            item.setdefault("era", "未分類")
+            item.setdefault("field", "未分類")
 
     if not valid:
         raise ValueError("有効な問題が1つもパースできませんでした。再度お試しください。")
@@ -223,21 +295,23 @@ def generate_quiz(
     pdf_text: str,
     era: str,
     field: str,
+    quiz_type: str = "4択問題",
     weak_areas: list[dict] | None = None,
     wrong_questions: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Generate 10 multiple-choice questions using Gemini API.
+    Generate 10 questions using Gemini API.
     Includes automatic retry with backoff and model fallback.
 
     Returns:
         A list of dicts with keys:
-        question, choices, answer_index, explanation, era, field
+        question, (choices), (answer_index), (answer), explanation, era, field
     """
     import time
 
     client = _get_client()
-    user_prompt = _build_user_prompt(pdf_text, era, field, weak_areas, wrong_questions)
+    user_prompt = _build_user_prompt(pdf_text, era, field, quiz_type, weak_areas, wrong_questions)
+    system_instruction = _SYSTEM_INSTRUCTIONS.get(quiz_type, _SYSTEM_INSTRUCTIONS["4択問題"])
 
     # Models to try in order (fallback chain)
     models = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
@@ -251,12 +325,12 @@ def generate_quiz(
                     model=model_name,
                     contents=user_prompt,
                     config=types.GenerateContentConfig(
-                        system_instruction=_SYSTEM_INSTRUCTION,
+                        system_instruction=system_instruction,
                         temperature=0.7,
                         max_output_tokens=8192,
                     ),
                 )
-                return _parse_quiz_json(response.text)
+                return _parse_quiz_json(response.text, quiz_type)
             except Exception as e:
                 last_error = e
                 error_str = str(e)
@@ -286,6 +360,7 @@ def prefetch_quiz_async(
     pdf_text: str,
     era: str,
     field: str,
+    quiz_type: str,
     weak_areas: list[dict] | None,
     wrong_questions: list[str] | None,
     result_holder: dict,
@@ -307,7 +382,7 @@ def prefetch_quiz_async(
     def _worker():
         try:
             questions = generate_quiz(
-                pdf_text, era, field, weak_areas, wrong_questions
+                pdf_text, era, field, quiz_type, weak_areas, wrong_questions
             )
             result_holder["questions"] = questions
             result_holder["error"] = None
